@@ -47,9 +47,71 @@ if not os.path.exists(token_tmp):
     f = open(token_tmp, "w+")
 
 # 앱키, 앱시크리트, 토큰, 계좌번호 등 저장관리, 자신만의 경로와 파일명으로 설정하시기 바랍니다.
-# pip install PyYAML (패키지설치)
-with open(os.path.join(config_root, "kis_devlp.yaml"), encoding="UTF-8") as f:
-    _cfg = yaml.load(f, Loader=yaml.FullLoader)
+# Try to load kis_devlp.yaml, fallback to .env if not found or missing fields
+_cfg = {}
+yaml_loaded = False
+try:
+    yaml_path = os.path.join(config_root, "kis_devlp.yaml")
+    if os.path.exists(yaml_path):
+        with open(yaml_path, encoding="UTF-8") as f:
+            loaded_yaml = yaml.load(f, Loader=yaml.FullLoader)
+            if isinstance(loaded_yaml, dict):
+                _cfg = loaded_yaml
+                yaml_loaded = True
+except Exception as e:
+    logging.warning(f"kis_devlp.yaml 로드 중 오류 발생: {e}")
+
+# Load .env fallback (.env가 우선순위를 가질 수 있도록 os.getenv fallback 처리)
+from dotenv import load_dotenv
+root_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+if os.path.exists(root_env):
+    load_dotenv(root_env)
+else:
+    config_root_env = os.path.join(config_root, "..", "..", ".env")
+    if os.path.exists(config_root_env):
+        load_dotenv(config_root_env)
+    else:
+        load_dotenv()
+
+# App Keys & Secrets
+_cfg.setdefault("my_app", os.getenv("KIS_REAL_APP_KEY", os.getenv("KIS_APP_KEY", "")))
+_cfg.setdefault("my_sec", os.getenv("KIS_REAL_APP_SECRET", os.getenv("KIS_APP_SECRET", "")))
+_cfg.setdefault("paper_app", os.getenv("KIS_APP_KEY", ""))
+_cfg.setdefault("paper_sec", os.getenv("KIS_APP_SECRET", ""))
+_cfg.setdefault("my_htsid", os.getenv("KIS_HTS_ID", "urbanist"))
+
+# Account configuration
+account_no = os.getenv("KIS_ACCOUNT_NO", "")
+cano = ""
+prod = "01"
+if "-" in account_no:
+    cano = account_no.split("-")[0]
+    prod = account_no.split("-")[1]
+else:
+    cano = account_no[:8]
+    prod = account_no[8:10] or "01"
+
+_cfg.setdefault("my_prod", prod)
+
+if prod in ["03", "08"]:
+    _cfg.setdefault("my_acct_future", os.getenv("KIS_REAL_ACCOUNT_NO", account_no).split("-")[0])
+    _cfg.setdefault("my_paper_future", cano)
+    _cfg.setdefault("my_acct_stock", "")
+    _cfg.setdefault("my_paper_stock", "")
+else:
+    _cfg.setdefault("my_acct_stock", os.getenv("KIS_REAL_ACCOUNT_NO", account_no).split("-")[0])
+    _cfg.setdefault("my_paper_stock", cano)
+    _cfg.setdefault("my_acct_future", "")
+    _cfg.setdefault("my_paper_future", "")
+
+# Domain info
+_cfg.setdefault("prod", "https://openapi.koreainvestment.com:9443")
+_cfg.setdefault("ops", "ws://ops.koreainvestment.com:21000")
+_cfg.setdefault("vps", "https://openapivts.koreainvestment.com:29443")
+_cfg.setdefault("vops", "ws://ops.koreainvestment.com:31000")
+
+# User Agent
+_cfg.setdefault("my_agent", os.getenv("KIS_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"))
 
 _TRENV = tuple()
 _last_auth_time = datetime.now()

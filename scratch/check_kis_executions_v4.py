@@ -1,0 +1,83 @@
+import os
+import sys
+import json
+import requests
+import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from config import config
+
+base_url = config.KIS_BASE_URL
+app_key = config.KIS_APP_KEY
+app_secret = config.KIS_APP_SECRET
+account_no = config.KIS_ACCOUNT_NO
+is_paper = config.KIS_IS_PAPER
+
+print(f"Base URL: {base_url}")
+print(f"Is Paper: {is_paper}")
+
+# Token with retries
+access_token = None
+for i in range(3):
+    try:
+        token_url = f"{base_url}/oauth2/tokenP"
+        token_res = requests.post(token_url, json={
+            "grant_type": "client_credentials",
+            "appkey": app_key,
+            "appsecret": app_secret
+        }, timeout=10)
+        access_token = token_res.json()["access_token"]
+        print("Token fetched successfully.")
+        break
+    except Exception as e:
+        print(f"Token attempt {i+1} failed: {e}")
+        time.sleep(1)
+
+if not access_token:
+    print("Could not obtain token. Exiting.")
+    sys.exit(1)
+
+cano, prdt_cd = account_no.split("-")
+ccnl_url = f"{base_url}/uapi/domestic-futureoption/v1/trading/inquire-ccnl"
+tr_id_ccnl = "VTTC0807R" if is_paper else "TTTC0807R"
+
+headers = {
+    "Content-Type": "application/json",
+    "authorization": f"Bearer {access_token}",
+    "appkey": app_key,
+    "appsecret": app_secret,
+    "tr_id": tr_id_ccnl
+}
+
+params = {
+    "CANO": cano,
+    "ACNT_PRDT_CD": prdt_cd,
+    "STRT_ORD_DT": "20260615",
+    "END_ORD_DT": "20260615",
+    "SLL_BUY_DVSN_CD": "00",
+    "CCLD_NCCS_DVSN": "00",
+    "SORT_SQN": "DS",
+    "PDNO": "",
+    "STRT_ODNO": "",
+    "MKET_ID_CD": "",
+    "CTX_AREA_FK200": "",
+    "CTX_AREA_NK200": ""
+}
+
+try:
+    print("Sending request to ccnl...")
+    res = requests.get(ccnl_url, headers=headers, params=params, timeout=15)
+    print("Status Code:", res.status_code)
+    if res.status_code == 200:
+        data = res.json()
+        print("rt_cd:", data.get("rt_cd"))
+        print("msg:", data.get("msg1"))
+        
+        output = data.get("output", [])
+        print(f"\n=== Execution History ({len(output)} items) ===")
+        for item in output:
+            print(f"Time: {item.get('ord_tmn') or item.get('ord_dt')} | Order No: {item.get('odno')} | Code: {item.get('shtn_pdno')} | Name: {item.get('prdt_name').strip() if item.get('prdt_name') else 'N/A'} | Side: {item.get('sll_buy_dvsn_name')} | Qty: {item.get('ord_qty')} | Exec Qty: {item.get('tot_ccld_qty')} | Exec Price: {item.get('avg_prc') or item.get('avg_price') or item.get('ccld_prc')} | Status: {item.get('rmnd_qty')}")
+    else:
+        print("Failed:", res.text)
+except Exception as e:
+    print("Request failed:", e)

@@ -1,0 +1,2 @@
+﻿id,detected_at,regime,adx,atr,volatility_level,trend_strength,action,signal_allowed,size_multiplier
+134,2026-05-11 10:50:46,ranging,10.00,1.20,normal,none,Prune Test Old,0,0.00

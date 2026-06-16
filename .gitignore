@@ -157,6 +157,7 @@ KIS/
 .master/
 .kis_token*.json
 
+secrets/
 # ===== Lean workspace =====
 .lean-workspace/
 

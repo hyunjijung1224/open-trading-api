@@ -33,8 +33,11 @@ from Crypto.Util.Padding import unpad
 def clearConsole():
     return os.system("cls" if os.name in ("nt", "dos") else "clear")
 
+
 key_bytes = 32
-config_root = os.path.join(os.path.expanduser("~"), "KIS", "config")
+config_root = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "KIS", "config"
+)
 # config_root = "$HOME/KIS/config/"  # 토큰 파일이 저장될 폴더, 제3자가 찾기 어렵도록 경로 설정하시기 바랍니다.
 # token_tmp = config_root + 'KIS000000'  # 토큰 로컬저장시 파일 이름 지정, 파일이름을 토큰값이 유추가능한 파일명은 삼가바랍니다.
 # token_tmp = config_root + 'KIS' + datetime.today().strftime("%Y%m%d%H%M%S")  # 토큰 로컬저장시 파일명 년월일시분초
@@ -47,9 +50,71 @@ if not os.path.exists(token_tmp):
     f = open(token_tmp, "w+")
 
 # 앱키, 앱시크리트, 토큰, 계좌번호 등 저장관리, 자신만의 경로와 파일명으로 설정하시기 바랍니다.
-# pip install PyYAML (패키지설치)
-with open(os.path.join(config_root, "kis_devlp.yaml"), encoding="UTF-8") as f:
-    _cfg = yaml.load(f, Loader=yaml.FullLoader)
+# Try to load kis_devlp.yaml, fallback to .env if not found or missing fields
+_cfg = {}
+yaml_loaded = False
+try:
+    yaml_path = os.path.join(config_root, "kis_devlp.yaml")
+    if os.path.exists(yaml_path):
+        with open(yaml_path, encoding="UTF-8") as f:
+            loaded_yaml = yaml.load(f, Loader=yaml.FullLoader)
+            if isinstance(loaded_yaml, dict):
+                _cfg = loaded_yaml
+                yaml_loaded = True
+except Exception as e:
+    logging.warning(f"kis_devlp.yaml 로드 중 오류 발생: {e}")
+
+# Load .env fallback (.env가 우선순위를 가질 수 있도록 os.getenv fallback 처리)
+from dotenv import load_dotenv
+root_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env")
+if os.path.exists(root_env):
+    load_dotenv(root_env)
+else:
+    config_root_env = os.path.join(config_root, "..", "..", ".env")
+    if os.path.exists(config_root_env):
+        load_dotenv(config_root_env)
+    else:
+        load_dotenv()
+
+# App Keys & Secrets
+_cfg.setdefault("my_app", os.getenv("KIS_REAL_APP_KEY", os.getenv("KIS_APP_KEY", "")))
+_cfg.setdefault("my_sec", os.getenv("KIS_REAL_APP_SECRET", os.getenv("KIS_APP_SECRET", "")))
+_cfg.setdefault("paper_app", os.getenv("KIS_APP_KEY", ""))
+_cfg.setdefault("paper_sec", os.getenv("KIS_APP_SECRET", ""))
+_cfg.setdefault("my_htsid", os.getenv("KIS_HTS_ID", "urbanist"))
+
+# Account configuration
+account_no = os.getenv("KIS_ACCOUNT_NO", "")
+cano = ""
+prod = "01"
+if "-" in account_no:
+    cano = account_no.split("-")[0]
+    prod = account_no.split("-")[1]
+else:
+    cano = account_no[:8]
+    prod = account_no[8:10] or "01"
+
+_cfg.setdefault("my_prod", prod)
+
+if prod in ["03", "08"]:
+    _cfg.setdefault("my_acct_future", os.getenv("KIS_REAL_ACCOUNT_NO", account_no).split("-")[0])
+    _cfg.setdefault("my_paper_future", cano)
+    _cfg.setdefault("my_acct_stock", "")
+    _cfg.setdefault("my_paper_stock", "")
+else:
+    _cfg.setdefault("my_acct_stock", os.getenv("KIS_REAL_ACCOUNT_NO", account_no).split("-")[0])
+    _cfg.setdefault("my_paper_stock", cano)
+    _cfg.setdefault("my_acct_future", "")
+    _cfg.setdefault("my_paper_future", "")
+
+# Domain info
+_cfg.setdefault("prod", "https://openapi.koreainvestment.com:9443")
+_cfg.setdefault("ops", "ws://ops.koreainvestment.com:21000")
+_cfg.setdefault("vps", "https://openapivts.koreainvestment.com:29443")
+_cfg.setdefault("vops", "ws://ops.koreainvestment.com:31000")
+
+# User Agent
+_cfg.setdefault("my_agent", os.getenv("KIS_USER_AGENT", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"))
 
 _TRENV = tuple()
 _last_auth_time = datetime.now()
@@ -118,7 +183,16 @@ def _getBaseHeader():
 def _setTRENV(cfg):
     nt1 = namedtuple(
         "KISEnv",
-        ["my_app", "my_sec", "my_acct", "my_prod", "my_htsid", "my_token", "my_url", "my_url_ws"],
+        [
+            "my_app",
+            "my_sec",
+            "my_acct",
+            "my_prod",
+            "my_htsid",
+            "my_token",
+            "my_url",
+            "my_url_ws",
+        ],
     )
     d = {
         "my_app": cfg["my_app"],  # 앱키
@@ -419,7 +493,7 @@ class APIRespError(APIResp):
 
 
 def _url_fetch(
-        api_url, ptr_id, tr_cont, params, appendHeaders=None, postFlag=False, hashFlag=True
+    api_url, ptr_id, tr_cont, params, appendHeaders=None, postFlag=False, hashFlag=True
 ):
     global _last_api_call_time
 
@@ -623,10 +697,10 @@ open_map: dict = {}
 
 
 def add_open_map(
-        name: str,
-        request: Callable[[str, str, ...], (dict, list[str])],
-        data: str | list[str],
-        kwargs: dict = None,
+    name: str,
+    request: Callable[[str, str, ...], (dict, list[str])],
+    data: str | list[str],
+    kwargs: dict = None,
 ):
     if open_map.get(name, None) is None:
         open_map[name] = {
@@ -645,11 +719,11 @@ data_map: dict = {}
 
 
 def add_data_map(
-        tr_id: str,
-        columns: list = None,
-        encrypt: str = None,
-        key: str = None,
-        iv: str = None,
+    tr_id: str,
+    columns: list = None,
+    encrypt: str = None,
+    key: str = None,
+    iv: str = None,
 ):
     if data_map.get(tr_id, None) is None:
         data_map[tr_id] = {"columns": [], "encrypt": False, "key": None, "iv": None}
@@ -754,12 +828,12 @@ class KISWebSocket:
     # func
     @classmethod
     async def send(
-            cls,
-            ws: websockets.ClientConnection,
-            request: Callable[[str, str, ...], (dict, list[str])],
-            tr_type: str,
-            data: str,
-            kwargs: dict = None,
+        cls,
+        ws: websockets.ClientConnection,
+        request: Callable[[str, str, ...], (dict, list[str])],
+        tr_type: str,
+        data: str,
+        kwargs: dict = None,
     ):
         k = {} if kwargs is None else kwargs
         msg, columns = request(tr_type, data, **k)
@@ -772,12 +846,12 @@ class KISWebSocket:
         smart_sleep()
 
     async def send_multiple(
-            self,
-            ws: websockets.ClientConnection,
-            request: Callable[[str, str, ...], (dict, list[str])],
-            tr_type: str,
-            data: list | str,
-            kwargs: dict = None,
+        self,
+        ws: websockets.ClientConnection,
+        request: Callable[[str, str, ...], (dict, list[str])],
+        tr_type: str,
+        data: list | str,
+        kwargs: dict = None,
     ):
         if type(data) is str:
             await self.send(ws, request, tr_type, data, kwargs)
@@ -789,28 +863,28 @@ class KISWebSocket:
 
     @classmethod
     def subscribe(
-            cls,
-            request: Callable[[str, str, ...], (dict, list[str])],
-            data: list | str,
-            kwargs: dict = None,
+        cls,
+        request: Callable[[str, str, ...], (dict, list[str])],
+        data: list | str,
+        kwargs: dict = None,
     ):
         add_open_map(request.__name__, request, data, kwargs)
 
     def unsubscribe(
-            self,
-            ws: websockets.ClientConnection,
-            request: Callable[[str, str, ...], (dict, list[str])],
-            data: list | str,
+        self,
+        ws: websockets.ClientConnection,
+        request: Callable[[str, str, ...], (dict, list[str])],
+        data: list | str,
     ):
         self.send_multiple(ws, request, "2", data)
 
     # start
     def start(
-            self,
-            on_result: Callable[
-                [websockets.ClientConnection, str, pd.DataFrame, dict], None
-            ],
-            result_all_data: bool = False,
+        self,
+        on_result: Callable[
+            [websockets.ClientConnection, str, pd.DataFrame, dict], None
+        ],
+        result_all_data: bool = False,
     ):
         self.on_result = on_result
         self.result_all_data = result_all_data
