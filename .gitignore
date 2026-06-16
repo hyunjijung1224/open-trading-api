@@ -30,7 +30,14 @@ share/python-wheels/
 MANIFEST
 pip-log.txt
 pip-delete-this-directory.txt
-*.sage.py
+
+# ===== Virtual environments =====
+.venv/
+venv/
+ENV/
+env/
+env.bak/
+venv.bak/
 
 # ===== Testing / Coverage =====
 htmlcov/
@@ -47,56 +54,10 @@ coverage.xml
 .pytest_cache/
 cover/
 
-# ===== Translations =====
-*.mo
-*.pot
-
-# ===== Django =====
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
-
-# ===== Flask =====
-instance/
-.webassets-cache
-
-# ===== Scrapy =====
-.scrapy
-
-# ===== Sphinx =====
-docs/_build/
-
-# ===== PyBuilder =====
-.pybuilder/
-target/
-
 # ===== Jupyter / IPython =====
 .ipynb_checkpoints
 profile_default/
 ipython_config.py
-
-# ===== pdm =====
-.pdm.toml
-.pdm-python
-.pdm-build/
-
-# ===== PEP 582 =====
-__pypackages__/
-
-# ===== Celery =====
-celerybeat-schedule
-celerybeat.pid
-
-# ===== Virtual environments =====
-.venv/
-venv/
-ENV/
-env/
-env.bak/
-venv.bak/
-
-# ===== uv =====
-.python-version
 
 # ===== Type checkers =====
 .mypy_cache/
@@ -108,17 +69,7 @@ dmypy.json
 # ===== Cython =====
 cython_debug/
 
-# ===== Spyder =====
-.spyderproject
-.spyproject
-
-# ===== Rope =====
-.ropeproject
-
-# ===== mkdocs =====
-/site
-
-# ===== IDE =====
+# ===== IDE / Editor =====
 .vscode/
 .idea/
 *.swp
@@ -126,19 +77,14 @@ cython_debug/
 *.sublime-project
 *.sublime-workspace
 
-# ===== Node / Frontend =====
-node_modules/
-.next/
-.vercel
-.pnp
-.pnp.*
-*.tsbuildinfo
-next-env.d.ts
-
 # ===== Environment / Secrets =====
 .env
 .env.local
 .env.*.local
+secrets/
+KIS/
+.master/
+.kis_token*.json
 *.pem
 
 # ===== Logs =====
@@ -149,23 +95,22 @@ yarn-error.log*
 .pnpm-debug.log*
 *_logs/
 
-# ===== Lock files =====
-*.lock
+# ===== Node / Frontend =====
+node_modules/
+.next/
+.vercel
+.pnp
+.pnp.*
+*.tsbuildinfo
+next-env.d.ts
 
-# ===== KIS (민감 정보) =====
-KIS/
-.master/
-.kis_token*.json
+# ===== uv =====
+.python-version
 
-secrets/
-# ===== Lean workspace =====
-.lean-workspace/
+# ===== Backtest output artifacts (regeneratable) =====
+backtest/
 
-# ===== Claude Code =====
-.claude/logs/*.log
-.claude/settings.local.json
-
-# ===== p2 output artifacts (regeneratable) =====
+# ===== Backtester output artifacts (regeneratable) =====
 backtester/examples/output/reports/*.html
 backtester/examples/output/screenshots/
 backtester/examples/output/*.yaml
@@ -173,7 +118,11 @@ backtester/examples/output/*.py
 !backtester/examples/output/.gitkeep
 !backtester/examples/output/reports/.gitkeep
 
-# ===== Claude settings =====
+# ===== Claude Code =====
+.claude/logs/*.log
+.claude/settings.local.json
 settings.local.json
 
+# ===== Other =====
+.lean-workspace/
 .serena/
