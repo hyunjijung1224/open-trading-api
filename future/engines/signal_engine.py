@@ -1,136 +1,107 @@
 import logging
 from datetime import datetime
-from typing import Dict, Any, List
-from config import config
+from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger("SignalEngine")
 
 class SignalEngine:
     """
-    3단계 게이트(Filter-Trigger) 매매 신호 생성 엔진
-    - 1단계: 시장 국면 필터 (regime != ranging)
-    - 2단계: 수급 검증 필터 (flow_direction, foreign_zscore)
-    - 3단계: 가격 모멘텀 트리거 (MACD 크로스)
-    - 가격 정보 다중공선성 제거 및 외국인/미결제약정 검증 타점 적용
-    """
-    def __init__(self, score_threshold: int = 0):
-        # 3단계 게이트로 개편되어 기존 score_threshold는 사용되지 않으나 하위 호환성 유지
-        self.score_threshold = score_threshold
+    스캘핑 신호 생성 엔진 — CVD/OFI/호가불균형/체결강도 4조건 AND 기반
 
-    def generate(self, code: str, regime: str, flow_direction: str, foreign_zscore: float, indicators: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        시장 국면, 수급 방향, 기술적 지표 트리거를 융합하여 최종 매수/매도/관망 신호 생성
-        """
-        # 아침 브리핑 모드인지 체크
-        if indicators.get("is_morning_mode"):
-            morning_dir = indicators["morning_direction"]
-            morning_score = indicators["morning_score"]
-            direction = "BUY" if morning_dir == "BUY" else "SELL"
-            reasons = [f"아침 개장 직후 모닝브리핑 데이터 기반 즉시 진입 격발 (방향: {direction}, 점수: {morning_score:+.2f})"]
-            logger.info(f"[MORNING MODE] 신호 발생 성공: {direction} ({reasons[0]})")
-            return {
-                "timestamp": datetime.now(),
-                "futures_code": code,
-                "direction": direction,
-                "strength": 1.0,
-                "score": 100 if direction == "BUY" else -100,
-                "reasons": reasons,
-                "regime": regime,
-                "flow_direction": "MORNING_MODE",
-                "foreign_zscore": morning_score,
-                "option_call_net": indicators.get("option_call_net", 0),
-                "option_put_net": indicators.get("option_put_net", 0),
-                "net_option_flow": indicators.get("option_call_net", 0) - indicators.get("option_put_net", 0)
-            }
+    LONG 조건 (전부 충족):
+      1) CVD direction = rising
+      2) OFI (30s) > 0
+      3) 호가불균형 (bid/ask) > 1.5
+      4) 체결강도 >= 130
+
+    SHORT 조건 (전부 충족):
+      1) CVD direction = falling
+      2) OFI (30s) < 0
+      3) 호가불균형 (bid/ask) < 0.67
+      4) 체결강도 <= 70
+    """
+    def __init__(self):
+        pass
+
+    def generate(self, code: str, regime: str, flow_direction: str, foreign_zscore: float,
+                 indicators: Dict[str, Any]) -> Dict[str, Any]:
+        """indicators에 order_flow / order_book / execution_pressure 데이터가 포함되어 넘어옴"""
 
         reasons = []
         direction = "HOLD"
-        
-        # 외국인 옵션 수급 분석 (Call - Put)
-        option_call_net = indicators.get("option_call_net", 0)
-        option_put_net = indicators.get("option_put_net", 0)
-        net_option_flow = option_call_net - option_put_net
-        
-        # 1. 3단계: 가격 기반 기술적 트리거 판정 (MACD 크로스)
-        macd = indicators.get("macd", 0.0)
-        prev_macd = indicators.get("prev_macd", 0.0)
-        macd_signal = indicators.get("macd_signal", 0.0)
-        prev_macd_signal = indicators.get("prev_macd_signal", 0.0)
-        
-        macd_trigger = None
-        if macd > macd_signal and prev_macd <= prev_macd_signal:
-            macd_trigger = "LONG"
-            reasons.append("MACD 골든크로스 트리거 격발 (LONG)")
-        elif macd < macd_signal and prev_macd >= prev_macd_signal:
-            macd_trigger = "SHORT"
-            reasons.append("MACD 데드크로스 트리거 격발 (SHORT)")
-            
-        # 2. 1단계: 시장 국면(Regime) 필터 검증
+        strength = 0.0
+
+        cvd_trend = indicators.get("cvd_trend", "neutral")
+        ofi = indicators.get("ofi_30s", 0.0)
+        imbalance = indicators.get("imbalance", 1.0)
+        exec_strength = indicators.get("exec_strength", 100.0)
+        delta_30s = indicators.get("delta_30s", 0.0)
+        buy_ratio = indicators.get("buy_ratio_30s", 50.0)
+
+        # 레짐 필터 (ranging 차단)
         if regime == "ranging":
-            direction = "HOLD"
-            reasons.append("1단계 시장 국면 필터: 횡보(ranging) 국면으로 진입 원천 차단 (HOLD)")
-            if macd_trigger:
-                reasons.append(f"차단된 신호: {macd_trigger}")
-                
-        # 3. 2단계: 수급 검증 필터 및 가격 트리거 결합
+            reasons.append("ranging 레짐: 진입 차단")
+            return self._result(code, "HOLD", 0.0, 0, reasons, regime, flow_direction, foreign_zscore, indicators)
+
+        # 외국인 필터 (FOREIGN_BLOCK 시 HOLD)
+        if flow_direction == "FOREIGN_BLOCK":
+            reasons.append("외국인 수급 필터 차단 (FOREIGN_BLOCK)")
+            return self._result(code, "HOLD", 0.0, 0, reasons, regime, flow_direction, foreign_zscore, indicators)
+
+        # 4조건 AND 평가
+        long_cond = (
+            cvd_trend == "rising"
+            and ofi > 0
+            and imbalance > 1.5
+            and exec_strength >= 130.0
+        )
+        short_cond = (
+            cvd_trend == "falling"
+            and ofi < 0
+            and imbalance < 0.67
+            and exec_strength <= 70.0
+        )
+
+        if long_cond:
+            direction = "BUY"
+            strength = 1.0
+            reasons.append(
+                f"CVD={cvd_trend} OFI={ofi:+.0f} 호가불균형={imbalance:.2f} 체결강도={exec_strength:.0f} → LONG"
+            )
+        elif short_cond:
+            direction = "SELL"
+            strength = 1.0
+            reasons.append(
+                f"CVD={cvd_trend} OFI={ofi:+.0f} 호가불균형={imbalance:.2f} 체결강도={exec_strength:.0f} → SHORT"
+            )
         else:
-            if macd_trigger == "LONG":
-                # 롱 진입 조건
-                # 옵션 필터 추가: net_option_flow가 음수(풋 우위)이면 롱 진입을 차단한다.
-                is_option_ok = True
-                if net_option_flow < 0:
-                    is_option_ok = False
-                    
-                if not is_option_ok:
-                    direction = "HOLD"
-                    reasons.append(f"2단계 옵션 수급 필터 차단: 외인 옵션 하방 우위 (Net Option Flow={net_option_flow:+,} 계약, 콜={option_call_net:+,}, 풋={option_put_net:+,})")
-                elif flow_direction == "LONG_ONLY":
-                    direction = "BUY"
-                    reasons.append(f"2단계 수급 필터 통과: 신규 롱 수급 검증 완료 (Z-Score={foreign_zscore:+.2f}, Net Option Flow={net_option_flow:+,})")
-                elif regime == "trending" and foreign_zscore >= -getattr(config, "ZSCORE_THRESHOLD", 0.2) and flow_direction != "SHORT_COVERING":
-                    direction = "BUY"
-                    reasons.append(f"2단계 수급 필터 통과: 강한 추세장 진입 허용 (Z-Score={foreign_zscore:+.2f}, 수급방향={flow_direction}, Net Option Flow={net_option_flow:+,})")
-                else:
-                    direction = "HOLD"
-                    reasons.append(f"2단계 수급 필터 차단: 롱 진입 요건 미달 (Z-Score={foreign_zscore:+.2f}, 수급방향={flow_direction})")
-                    
-            elif macd_trigger == "SHORT":
-                # 숏 진입 조건
-                # 옵션 필터 추가: net_option_flow가 양수(콜 우위)이면 숏 진입을 차단한다.
-                is_option_ok = True
-                if net_option_flow > 0:
-                    is_option_ok = False
-                    
-                if not is_option_ok:
-                    direction = "HOLD"
-                    reasons.append(f"2단계 옵션 수급 필터 차단: 외인 옵션 상방 우위 (Net Option Flow={net_option_flow:+,} 계약, 콜={option_call_net:+,}, 풋={option_put_net:+,})")
-                elif flow_direction == "SHORT_ONLY":
-                    direction = "SELL"
-                    reasons.append(f"2단계 수급 필터 통과: 신규 숏 수급 검증 완료 (Z-Score={foreign_zscore:+.2f}, Net Option Flow={net_option_flow:+,})")
-                elif regime == "trending" and foreign_zscore <= getattr(config, "ZSCORE_THRESHOLD", 0.2) and flow_direction != "LONG_LIQUIDATION":
-                    direction = "SELL"
-                    reasons.append(f"2단계 수급 필터 통과: 강한 추세장 진입 허용 (Z-Score={foreign_zscore:+.2f}, 수급방향={flow_direction}, Net Option Flow={net_option_flow:+,})")
-                else:
-                    direction = "HOLD"
-                    reasons.append(f"2단계 수급 필터 차단: 숏 진입 요건 미달 (Z-Score={foreign_zscore:+.2f}, 수급방향={flow_direction})")
-        
+            reasons.append(
+                f"CVD={cvd_trend} OFI={ofi:+.0f} 호가불균형={imbalance:.2f} 체결강도={exec_strength:.0f} → 조건 미충족 HOLD"
+            )
+
+        score = 100 if direction == "BUY" else (-100 if direction == "SELL" else 0)
+
         if direction != "HOLD":
-            logger.info(f"신호 발생 성공: {direction} (이유: {', '.join(reasons)})")
+            logger.info(f"[SIGNAL] {direction} 이유: {reasons[-1]}")
         else:
-            if macd_trigger:
-                logger.info(f"신호 진입 차단: {macd_trigger} -> HOLD (이유: {', '.join(reasons)})")
-                
+            logger.debug(f"[SIGNAL] HOLD {reasons[-1]}")
+
+        return self._result(code, direction, strength, score, reasons, regime, flow_direction, foreign_zscore, indicators)
+
+    def _result(self, code: str, direction: str, strength: float, score: int,
+                reasons: List[str], regime: str, flow_direction: str,
+                foreign_zscore: float, indicators: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "timestamp": datetime.now(),
             "futures_code": code,
             "direction": direction,
-            "strength": 1.0 if direction != "HOLD" else 0.0,
-            "score": 100 if direction == "BUY" else (-100 if direction == "SELL" else 0),
+            "strength": strength,
+            "score": score,
             "reasons": reasons,
             "regime": regime,
             "flow_direction": flow_direction,
             "foreign_zscore": foreign_zscore,
-            "option_call_net": option_call_net,
-            "option_put_net": option_put_net,
-            "net_option_flow": net_option_flow
+            "option_call_net": indicators.get("option_call_net", 0),
+            "option_put_net": indicators.get("option_put_net", 0),
+            "net_option_flow": indicators.get("option_call_net", 0) - indicators.get("option_put_net", 0),
         }

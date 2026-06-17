@@ -53,6 +53,14 @@ class Config:
     ENABLE_NIGHT_TRADING = os.getenv("ENABLE_NIGHT_TRADING", "False").lower() in ("true", "1", "t", "yes")
     FORCE_CLOSE_MINUTES_BEFORE_CLOSE = int(os.getenv("FORCE_CLOSE_MINUTES_BEFORE_CLOSE", "15"))
 
+    # ── 모닝 엔진 설정 (08:45~09:30) ───────────────────────────
+    MORNING_ENGINE_ENABLED = os.getenv("MORNING_ENGINE_ENABLED", "True").lower() in ("true", "1", "t", "yes")
+    MORNING_SCORE_THRESHOLD = int(os.getenv("MORNING_SCORE_THRESHOLD", "7"))  # 진입 임계점 (0~10)
+    MORNING_GAP_STRONG_PCT = float(os.getenv("MORNING_GAP_STRONG_PCT", "1.0"))  # 강한 갭 임계값 (%)
+    MORNING_GAP_MEDIUM_PCT = float(os.getenv("MORNING_GAP_MEDIUM_PCT", "0.5"))  # 중간 갭 임계값 (%)
+    MORNING_GAP_FILL_PCT = float(os.getenv("MORNING_GAP_FILL_PCT", "1.5"))  # 갭.FILL 임계값 (%)
+    MORNING_ORB_MINUTES = int(os.getenv("MORNING_ORB_MINUTES", "5"))  # ORB 범위 수집 시간 (분)
+
     # ── 거래 파라미터 설정 ───────────────────────────
     # MACD 파라미터
     MACD_FAST = int(os.getenv("MACD_FAST", 5))

@@ -4,6 +4,7 @@ import logging
 import asyncio
 import requests
 import json
+import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional
 from config import config
@@ -322,12 +323,13 @@ class TelegramAgent:
     # =========================================================================
     # 아침 브리핑 및 글로벌 뉴스 Grounding 생성
     # =========================================================================
-    def ask_gemini_with_search(self, prompt: str) -> str:
-        """Google Search Grounding을 통해 실시간 외신/지표 기반 요약 생성"""
+    def ask_gemini_with_search(self, prompt: str, max_retries: int = 2) -> str:
+        """Google Search Grounding을 통해 실시간 외신/지표 기반 요약 생성 (재시도 포함)"""
         if not self.api_key:
-            return "GEMINI_API_KEY 설정이 없습니다."
+            logger.error("GEMINI_API_KEY 설정이 없습니다.")
+            return ""
             
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key={self.api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={self.api_key}"
         headers = {"Content-Type": "application/json"}
         payload = {
             "contents": [
@@ -339,17 +341,94 @@ class TelegramAgent:
                 {"googleSearch": {}}
             ]
         }
-        try:
-            res = requests.post(url, json=payload, headers=headers, timeout=30)
-            if res.status_code == 200:
+        
+        for attempt in range(max_retries + 1):
+            try:
+                logger.info(f"Gemini Search Grounding 호출 시도 {attempt + 1}/{max_retries + 1}")
+                res = requests.post(url, json=payload, headers=headers, timeout=45)
+                
+                if res.status_code != 200:
+                    logger.error(f"Gemini API HTTP {res.status_code}: {res.text[:500]}")
+                    if attempt < max_retries:
+                        continue
+                    return ""
+                
                 data = res.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                logger.error(f"Gemini Search Grounding 실패: {res.text}")
-                return "글로벌 뉴스 브리핑을 생성하는 데 실패했습니다."
-        except Exception as e:
-            logger.error(f"Gemini Search API 호출 오류: {e}")
-            return "글로벌 마켓 소식을 불러올 수 없습니다."
+                
+                # 응답 구조 검증
+                candidates = data.get("candidates", [])
+                if not candidates:
+                    logger.error(f"Gemini 응답에 candidates 없음: {json.dumps(data)[:500]}")
+                    if attempt < max_retries:
+                        continue
+                    return ""
+                
+                content = candidates[0].get("content", {})
+                parts = content.get("parts", [])
+                if not parts:
+                    logger.error(f"Gemini 응답에 parts 없음: {json.dumps(content)[:500]}")
+                    if attempt < max_retries:
+                        continue
+                    return ""
+                
+                text = parts[0].get("text", "")
+                if not text or not text.strip():
+                    logger.error(f"Gemini 응답 텍스트 비어있음 (attempt {attempt + 1})")
+                    if attempt < max_retries:
+                        continue
+                    return ""
+                
+                logger.info(f"Gemini 응답 수신 성공 (길이={len(text)})")
+                return text
+                
+            except requests.exceptions.Timeout:
+                logger.warning(f"Gemini API 타임아웃 (attempt {attempt + 1}/{max_retries + 1})")
+                if attempt < max_retries:
+                    continue
+                return ""
+            except Exception as e:
+                logger.error(f"Gemini API 호출 오류 (attempt {attempt + 1}): {e}")
+                if attempt < max_retries:
+                    continue
+                return ""
+        
+        return ""
+
+    @staticmethod
+    def _extract_json_from_text(text: str) -> str:
+        """텍스트에서 JSON 블록 추출 (마크다운 펜스, 혼재 텍스트 등 처리)"""
+        if not text or not text.strip():
+            return ""
+        
+        cleaned = text.strip()
+        
+        # 1. 마크다운 코드 펜스 제거
+        # ```json ... ``` 또는 ``` ... ```
+        fence_match = re.search(r'```(?:json)?\s*\n?(.*?)\n?\s*```', cleaned, re.DOTALL)
+        if fence_match:
+            cleaned = fence_match.group(1).strip()
+        
+        # 2. 이미 JSON이면 그대로 반환
+        if cleaned.startswith('{') and cleaned.endswith('}'):
+            return cleaned
+        
+        # 3. 텍스트 혼재 시 첫 번째 { ... } 블록 추출
+        start = cleaned.find('{')
+        end = cleaned.rfind('}')
+        if start != -1 and end != -1 and end > start:
+            candidate = cleaned[start:end + 1]
+            # 괄호 균형 확인
+            depth = 0
+            for ch in candidate:
+                if ch == '{':
+                    depth += 1
+                elif ch == '}':
+                    depth -= 1
+            if depth == 0:
+                return candidate
+        
+        # 4. 추출 실패 — 원본 반환 (json.loads에서 에러 발생시킴)
+        return cleaned
 
     def _get_night_futures_summary(self) -> str:
         """데이터베이스에서 미니야간선물(101W09) 시세 요약 산출"""
@@ -468,6 +547,58 @@ class TelegramAgent:
             logger.error(f"임시 베이시스 브리핑 요약 생성 실패: {e}")
             return "📊 장전 임시 베이시스: 분석 중 에러 발생"
 
+    def _get_fred_economic_data(self) -> Dict[str, Any]:
+        """FRED API에서 주요 경제 지표 조회 (Federal Funds Rate, 10Y Treasury, VIX 등)"""
+        result = {}
+        fred_key = config.FRED_API_KEY
+        if not fred_key:
+            logger.warning("FRED_API_KEY 미설정, 경제 데이터 스킵")
+            return result
+        
+        # FRED 시리즈 ID 매핑
+        series_map = {
+            "fed_funds_rate": "FEDFUNDS",       # 연방기금금리
+            "treasury_10y": "DGS10",             # 10년 국채수익률
+            "treasury_2y": "DGS2",               # 2년 국채수익률
+            "cpi": "CPIAUCSL",                   # 소비자물가지수
+            "unemployment": "UNRATE",            # 실업률
+            "gdp": "GDP",                        # GDP
+            "vix": "VIXCLS",                     # VIX
+            "dxy": "DTWEXBGS",                   # 달러인덱스
+            "oil": "DCOILWTICO",                 # WTI 원유
+            "gold": "GOLDAMGBD228NLBM",          # 금
+        }
+        
+        for name, series_id in series_map.items():
+            try:
+                url = f"https://api.stlouisfed.org/fred/series/observations"
+                params = {
+                    "series_id": series_id,
+                    "api_key": fred_key,
+                    "file_type": "json",
+                    "sort_order": "desc",
+                    "limit": 1,
+                }
+                res = requests.get(url, params=params, timeout=10)
+                if res.status_code == 200:
+                    data = res.json()
+                    observations = data.get("observations", [])
+                    if observations:
+                        obs = observations[0]
+                        value = obs.get("value")
+                        date = obs.get("date")
+                        if value and value != ".":
+                            result[name] = {"value": float(value), "date": date}
+                            logger.debug(f"FRED {name}: {value} ({date})")
+                else:
+                    logger.warning(f"FRED {name} 조회 실패: HTTP {res.status_code}")
+            except Exception as e:
+                logger.warning(f"FRED {name} 조회 오류: {e}")
+        
+        if result:
+            logger.info(f"FRED 경제 데이터 {len(result)}개 조회 완료: {list(result.keys())}")
+        return result
+
     # =========================================================================
     # 스케줄러 트리거 메소드
     # =========================================================================
@@ -481,6 +612,15 @@ class TelegramAgent:
         # 1.5. 장전 임시 베이시스 정보 요약
         temp_basis_info = self._get_temp_basis_summary_for_brief()
         
+        # 1.6. FRED 경제 데이터 조회
+        fred_data = self._get_fred_economic_data()
+        fred_info = ""
+        if fred_data:
+            fred_lines = []
+            for name, info in fred_data.items():
+                fred_lines.append(f"  - {name}: {info['value']} ({info['date']})")
+            fred_info = f"[FRED 경제 지표]\n" + "\n".join(fred_lines) + "\n\n"
+        
         # 2. Gemini Search Grounding을 활용한 글로벌 마켓 및 장전 현물 시장 분석 (JSON 응답 유도)
         prompt = (
             "오늘 아침 주식/선물 트레이더를 위한 글로벌 시장 및 국내 현물 시장 분석 브리핑을 작성하고, "
@@ -488,6 +628,7 @@ class TelegramAgent:
             "또한 전날 마감한 국내외 주요 종합지수(KOSPI 200, KOSPI, KOSDAQ, S&P 500, Nasdaq, Dow Jones, Nikkei 225) 및 현재 시점의 미국 Nasdaq 100 선물 지수, 그리고 USD/KRW 원달러 환율 정보를 구글 검색을 활용해 정확히 수집하여 함께 제공해 주세요.\n\n"
             f"[장전 실시간 대형주 기반 임시 베이시스 데이터]\n"
             f"{temp_basis_info}\n\n"
+            f"{fred_info}"
             "분석 대상:\n"
             "1. 어젯밤 마감한 미국 뉴욕 증시(S&P 500, Nasdaq, Dow Jones)의 종가 현황 및 주요 등락 요인\n"
             "2. 주말 및 저녁 사이 발생한 주요 매크로 뉴스/지정학적 요소\n"
@@ -514,20 +655,14 @@ class TelegramAgent:
         )
         global_news = self.ask_gemini_with_search(prompt)
         
-        # JSON 문자열 추출 및 정돈
-        cleaned_news = global_news.strip()
-        if cleaned_news.startswith("```json"):
-            cleaned_news = cleaned_news[7:]
-        elif cleaned_news.startswith("```"):
-            cleaned_news = cleaned_news[3:]
-        if cleaned_news.endswith("```"):
-            cleaned_news = cleaned_news[:-3]
-        cleaned_news = cleaned_news.strip()
+        # JSON 문자열 추출 및 정돈 (개선된 로직)
+        cleaned_news = self._extract_json_from_text(global_news)
+        logger.info(f"Gemini 응답 JSON 추출 결과: 길이={len(cleaned_news)}, 시작={cleaned_news[:100] if cleaned_news else '(empty)'}")
  
         score = 0.0
         direction = "HOLD"
         rationale = "분석 실패"
-        briefing_text = global_news
+        briefing_text = global_news if global_news else "Gemini 응답 없음"
         kospi200 = None
         kospi = None
         kosdaq = None
@@ -567,8 +702,10 @@ class TelegramAgent:
             if direction not in ["BUY", "SELL", "HOLD"]:
                 direction = "HOLD"
         except Exception as e:
-            logger.error(f"Gemini 응답 JSON 파싱 실패: {e}. 원본 응답: {global_news}")
-            briefing_text = global_news
+            logger.error(f"Gemini 응답 JSON 파싱 실패: {e}")
+            logger.error(f"  추출된 문자열 (앞 300자): {cleaned_news[:300]}")
+            logger.error(f"  원본 Gemini 응답 (앞 500자): {global_news[:500] if global_news else '(empty)'}")
+            briefing_text = global_news if global_news else "Gemini 응답 파싱 실패"
             rationale = f"JSON 파싱 실패 ({e})"
  
         # DB에 아침 브리핑 점수 및 방향 저장

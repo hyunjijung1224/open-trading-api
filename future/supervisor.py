@@ -8,6 +8,10 @@ from future.store.mariadb_store import MariaDBStore
 from future.store.sheets_store import SheetsStore
 from future.ws_manager import WebSocketManager
 from future.engines.telegram_agent import TelegramAgent
+from future.engines.order_flow_engine import OrderFlowEngine
+from future.engines.order_book_engine import OrderBookEngine
+from future.engines.execution_pressure_engine import ExecutionPressureEngine
+from future.engines.morning_engine import MorningEngine
 
 logger = logging.getLogger("TradingSupervisor")
 
@@ -48,6 +52,10 @@ class TradingSupervisor:
         self.risk_engine = None
         self.execution_engine = None
         self.ai_risk_agent = None
+        self.order_flow_engine = None
+        self.order_book_engine = None
+        self.execution_pressure_engine = None
+        self.morning_engine = None
         
         # Telegram Agent 초기화
         self.telegram_agent = TelegramAgent(self)
@@ -79,6 +87,17 @@ class TradingSupervisor:
         self._rest_price_poll_interval: int = 5  # 5초마다 REST 현재가 폴링
         self._last_rest_price: Optional[float] = None  # 마지막으로 획득한 REST 현재가
         self.last_pre_market_sync: datetime = datetime.min
+        
+        # 모닝 엔진용 야간 컨텍스트 (08:00~08:45 수집, 08:45 주입)
+        self._overnight_context: Dict[str, Any] = {
+            "night_futures_return": 0.0,
+            "sp500_return": 0.0,
+            "nasdaq_return": 0.0,
+            "usdkrw_change": 0.0,
+            "foreign_net_buy": 0,
+            "oi_change": 0,
+            "prev_close": 0.0,
+        }
         self.latest_temp_basis: float = 0.0
         
         # 성능 엔진(Performance Engine) 업데이트 주기 제어 변수
@@ -91,7 +110,8 @@ class TradingSupervisor:
         self._latest_option_call_net: int = 0
         self._latest_option_put_net: int = 0
 
-    def load_engines(self, regime_eng, signal_eng, flow_eng, vol_eng, perf_eng, risk_eng, exec_eng, ai_agent):
+    def load_engines(self, regime_eng, signal_eng, flow_eng, vol_eng, perf_eng, risk_eng, exec_eng, ai_agent,
+                     order_flow_eng=None, order_book_eng=None, exec_pressure_eng=None, morning_eng=None):
         """각 트레이딩 핵심 엔진 주입"""
         self.regime_engine = regime_eng
         self.signal_engine = signal_eng
@@ -101,6 +121,10 @@ class TradingSupervisor:
         self.risk_engine = risk_eng
         self.execution_engine = exec_eng
         self.ai_risk_agent = ai_agent
+        self.order_flow_engine = order_flow_eng
+        self.order_book_engine = order_book_eng
+        self.execution_pressure_engine = exec_pressure_eng
+        self.morning_engine = morning_eng
 
     async def start(self):
         """시스템 시동 및 메인 오케스트레이션 루프 시작"""
@@ -308,24 +332,91 @@ class TradingSupervisor:
         day_force_start = (datetime.combine(now.date(), day_close_time) - timedelta(minutes=force_close_minutes)).time()
         is_day_force_window = day_force_start <= now_time < day_close_time
         
+        # 장 종료 후 2분 내(15:45~15:47)에도 미청산 포지션이 있으면 마지막 기회로 청산 시도
+        day_close_dt = datetime.combine(now.date(), day_close_time)
+        grace_end = (day_close_dt + timedelta(minutes=2)).time()
+        is_post_close_safety = day_close_time <= now_time <= grace_end and not is_day_force_window
+        
         # 2. 야간장 마감 임박 체크 (06:00 장 마감 기준, 야간 매매 활성화 시에만 적용)
         is_night_force_window = False
+        is_post_night_safety = False
         if getattr(config, "ENABLE_NIGHT_TRADING", False):
             night_close_time = datetime_time(6, 0)
             night_force_start = (datetime.combine(now.date(), night_close_time) - timedelta(minutes=force_close_minutes)).time()
             is_night_force_window = night_force_start <= now_time < night_close_time
+            night_close_dt = datetime.combine(now.date(), night_close_time)
+            night_grace_end = (night_close_dt + timedelta(minutes=2)).time()
+            is_post_night_safety = night_close_time <= now_time <= night_grace_end and not is_night_force_window
 
-        if is_day_force_window or is_night_force_window:
+        if is_day_force_window or is_night_force_window or is_post_close_safety or is_post_night_safety:
+            # 강제청산 전 KIS 잔고 동기화 — 외부에서 생성된 포지션이 로컬 캐시에 없을 수 있음
+            try:
+                await self._sync_positions_with_kis()
+            except Exception as e:
+                logger.error(f"강제청산 전 KIS 잔고 동기화 실패: {e}")
+            
             if self.active_positions:
+                reason = "장 마감 임박 강제 청산" if (is_day_force_window or is_night_force_window) else "장 종료 후 미청산 포지션 최종 청산"
                 logger.warning(
-                    f"[FORCE CLOSE] 장 마감 {force_close_minutes}분 전 감지! "
+                    f"[FORCE CLOSE] {reason}! "
                     f"현재 포지션 {len(self.active_positions)}개 전량 시장가 청산 실행."
                 )
                 for pos in list(self.active_positions):
-                    await self._execute_emergency_close(pos, reason="장 마감 임박 강제 청산")
+                    await self._execute_emergency_close(pos, reason=reason)
             return True
             
         return False
+
+    def _is_force_close_active(self) -> bool:
+        """현재 강제청산 윈도우(진입 금지 구간)인지 동기적으로 판단 (KIS 동기화 없이 판별만)"""
+        now = config.get_kst_now()
+        now_time = now.time()
+        force_close_minutes = getattr(config, "FORCE_CLOSE_MINUTES_BEFORE_CLOSE", 5)
+        is_final_day = self._is_final_trading_day(now)
+        day_close_time = datetime_time(15, 20) if is_final_day else datetime_time(15, 45)
+        day_force_start = (datetime.combine(now.date(), day_close_time) - timedelta(minutes=force_close_minutes)).time()
+        grace_end = (datetime.combine(now.date(), day_close_time) + timedelta(minutes=2)).time()
+        if day_force_start <= now_time <= grace_end:
+            return True
+        if getattr(config, "ENABLE_NIGHT_TRADING", False):
+            night_close_time = datetime_time(6, 0)
+            night_force_start = (datetime.combine(now.date(), night_close_time) - timedelta(minutes=force_close_minutes)).time()
+            night_grace_end = (datetime.combine(now.date(), night_close_time) + timedelta(minutes=2)).time()
+            if night_force_start <= now_time <= night_grace_end:
+                return True
+        return False
+
+    async def _manage_morning_session(self, now: datetime, latest_price: float):
+        """모닝 세션 관리 — 08:45~09:30 구간에서 모닝 엔진 활성화/비활성화 및 handoff"""
+        if not self.morning_engine:
+            return
+
+        now_time = now.time()
+        morning_start = datetime_time(8, 45)
+        morning_end = datetime_time(9, 30)
+
+        # ── 모닝 세션 활성화 (08:45 도달 시) ──
+        if morning_start <= now_time <= morning_end and not self.morning_engine.is_active:
+            # 전일 종가 획득
+            prev_close = 0.0
+            if self._history_candles:
+                prev_close = self._history_candles[-1].get("close", 0.0)
+            
+            # 야간 컨텍스트 주입 (이미 수집된 데이터 사용)
+            if prev_close > 0:
+                self._overnight_context["prev_close"] = prev_close
+            self.morning_engine.set_overnight_context(self._overnight_context.copy())
+            
+            self.morning_engine.activate(latest_price, prev_close)
+
+        # ── 모닝 세션 비활성화 (09:30 초과 시 handoff) ──
+        if now_time > morning_end and self.morning_engine.is_active:
+            handoff = self.morning_engine.deactivate()
+            if handoff.get("entry_made"):
+                logger.info(
+                    f"[MORNING HANDOFF] 모닝 포지션 인수: "
+                    f"{handoff['position_side']} {handoff['position_qty']}계약 @ {handoff['position_entry_price']:.2f}"
+                )
 
     async def _manage_subscriptions_by_session(self, session: str):
         """현재 시장 세션에 따라 주간/야간 종목 웹소켓 구독 스위칭"""
@@ -377,10 +468,31 @@ class TradingSupervisor:
         self.current_session = session
 
     def _on_realtime_execution(self, exec_data: Dict[str, Any]):
-        """웹소켓 실시간 가격 수신 시 즉시 호출되는 초단위 손절 감시 + 1분봉 집계 콜백"""
+        """웹소켓 실시간 가격 수신 시 즉시 호출되는 초단위 손절 감시 + 1분봉 집계 + Order Flow/체결강도 피드"""
         # 단축코드를 시스템 표준코드로 역변환하여 매핑 연동
         db_code = self._to_db_code(exec_data["code"])
         current_price = exec_data["price"]
+        
+        # ── Order Flow Engine / Execution Pressure Engine 틱 데이터 공급 ──
+        if self.order_flow_engine and "total_buy_vol" in exec_data:
+            self.order_flow_engine.update(
+                code=db_code,
+                price=current_price,
+                last_volume=exec_data.get("last_volume", 0),
+                total_buy_vol=exec_data["total_buy_vol"],
+                total_sell_vol=exec_data["total_sell_vol"],
+                buy_ratio=exec_data.get("buy_ratio", 50.0),
+                exec_strength=exec_data.get("exec_strength", 100.0),
+            )
+        if self.execution_pressure_engine and "exec_strength" in exec_data:
+            self.execution_pressure_engine.update(
+                code=db_code,
+                price=current_price,
+                exec_strength=exec_data["exec_strength"],
+                net_buy_count=exec_data.get("net_buy_count", 0),
+                buy_ratio=exec_data.get("buy_ratio", 50.0),
+                last_volume=exec_data.get("last_volume", 0),
+            )
         
         # 50틱마다 데이터 유입 로그 출력 (시각화 모니터링용)
         self._tick_log_count += 1
@@ -554,9 +666,14 @@ class TradingSupervisor:
             self._candle_tick_count = 0
 
     def _on_realtime_orderbook(self, ob_data: Dict[str, Any]):
-        """웹소켓 실시간 호가 수신 콜백 (스프레드 감시용)"""
-        # 필요시 호가 정보를 활용한 변동성 보정이나 유동성(Spread) 검증 로직 반영 가능
-        pass
+        """웹소켓 실시간 호가 수신 콜백 → OrderBookEngine 공급"""
+        db_code = self._to_db_code(ob_data["code"])
+        if self.order_book_engine:
+            self.order_book_engine.update(
+                code=db_code,
+                total_ask_vol=ob_data["total_ask_vol"],
+                total_bid_vol=ob_data["total_bid_vol"],
+            )
 
     def _on_my_order_fill(self, fill_data: Dict[str, Any]):
         """주문 체결 통보 수신 시 내부 DB 및 포지션 동기화 즉시 실행"""
@@ -626,6 +743,14 @@ class TradingSupervisor:
                     )
         except Exception as e:
             logger.error(f"긴급 청산 실패: {e}")
+            self.send_telegram(
+                f"[ALERT] [긴급 청산 실패] {reason}\n"
+                f"- 종목: {pos.get('futures_code', '?')}\n"
+                f"- 방향: {pos.get('side', '?')}\n"
+                f"- 수량: {pos.get('quantity', '?')}계약\n"
+                f"- 오류: {e}\n"
+                f"※ 수동 확인 필요!"
+            )
 
     async def _execute_partial_close(self, pos: Dict[str, Any], qty: int, reason: str):
         """실시간 일부(50%) 분할 익절 집행"""
@@ -920,6 +1045,10 @@ class TradingSupervisor:
                 if session in ["day_market", "night_market"]:
                     now = datetime.now()
                     
+                    # 강제청산은 latest_price 유무와 무관하게 매 루프마다 반드시 체크
+                    # (웹소켓/REST 모두 끊긴 상황에서도 장 마감 시 청산 보장)
+                    await self._check_and_force_close_at_session_end()
+                    
                     # 웹소켓 현재가 우선 확인
                     latest_price = self.ws_manager.get_latest_price(self._to_kis_code(self.current_code))
                     
@@ -938,7 +1067,17 @@ class TradingSupervisor:
                         if (now - self.last_rest_sync).total_seconds() >= 60:
                             await self._sync_supplementary_data()
                             self.last_rest_sync = now
-                            
+                        
+                        # 모닝 스캘핑 세션 관리 (08:45~09:30)
+                        await self._manage_morning_session(now, latest_price)
+                        
+                        # ORB 데이터 수집 (08:45~08:50 구간)
+                        if self.morning_engine and self.morning_engine.is_active:
+                            orb_start = now.time().replace(hour=8, minute=45, second=0)
+                            orb_end = now.time().replace(hour=8, minute=50, second=0)
+                            if orb_start <= now.time() <= orb_end:
+                                self.morning_engine.update_orb(latest_price)
+                        
                         # 거래 흐름 집행
                         await self._process_trading_logic(latest_price)
                 elif session == "pre_market":
@@ -1104,8 +1243,132 @@ class TradingSupervisor:
             }
             self.db.save_pre_market_basis(db_data)
 
+            # 5. 모닝 엔진 야간 컨텍스트 업데이트
+            self._overnight_context["night_futures_return"] = futs_return * 100
+            self._overnight_context["prev_close"] = futs_prev_close
+            if self.morning_engine:
+                self.morning_engine.set_overnight_context(self._overnight_context.copy())
+                logger.info("[PRE-MARKET] 모닝 엔진 야간 컨텍스트 주입 완료")
+
         except Exception as e:
             logger.error(f"[PRE-MARKET] 임시 베이시스 집계 중 오류 발생: {e}", exc_info=True)
+
+    async def _process_morning_trading(self, current_price: float):
+        """
+        모닝 트레이딩 처리 — 08:45~09:30 구간 전용
+        5개 전략 기반 bull_score/bear_score 산출, 7점 이상 진입
+        """
+        if not self.morning_engine or not self.morning_engine.is_active:
+            return
+
+        # 실시간 지표 수집
+        indicators = {}
+        db_code = self.current_code
+
+        if self.order_flow_engine:
+            indicators["cvd_trend"] = self.order_flow_engine.get_cvd_trend(db_code)
+            indicators["delta_30s"] = self.order_flow_engine.get_delta(db_code, 30)
+            indicators["buy_ratio_30s"] = self.order_flow_engine.get_buy_ratio(db_code, 30)
+        if self.order_book_engine:
+            indicators["imbalance"] = self.order_book_engine.get_imbalance(db_code)
+            indicators["ofi_30s"] = self.order_book_engine.get_ofi(db_code, 30)
+        if self.execution_pressure_engine:
+            indicators["exec_strength"] = self.execution_pressure_engine.get_exec_strength(db_code)
+            indicators["exec_avg_strength_30s"] = self.execution_pressure_engine.get_avg_exec_strength(db_code, 30)
+
+        # 베이시스 (pre_market_basis 사용)
+        indicators["basis"] = self.latest_temp_basis
+
+        # OI 변화
+        if len(self._history_candles) >= 2:
+            curr_oi = self._history_candles[-1].get("open_interest", 0)
+            prev_oi = self._history_candles[-2].get("open_interest", 0)
+            indicators["oi_change"] = curr_oi - prev_oi if curr_oi > 0 and prev_oi > 0 else 0
+
+        # 모닝 엔진으로 신호 평가
+        signal = self.morning_engine.evaluate(current_price, indicators)
+
+        if signal["direction"] == "HOLD":
+            return
+
+        # ── 이미 포지션이 있으면 신호 무시 (모닝 모드는 1회 진입) ──
+        if self.active_positions:
+            logger.debug(f"[MORNING] 포지션 보유 중, 신호 무시 ({signal['direction']})")
+            return
+
+        # ── Volatility Engine → ATR 기반 손절/익절가 산출 ──
+        vol_state = self.volatility_engine.analyze() if self.volatility_engine else {}
+        atr = vol_state.get("atr", self._latest_atr)
+
+        stop_loss = current_price - (atr * 2.0)
+        take_profit = current_price + (atr * 3.0)
+
+        # ── Performance Engine → 최근 거래 기반 사이징 가중치 ──
+        current_cap = self.execution_engine.current_capital if self.execution_engine else 100_000_000.0
+        perf_metrics = self.performance_engine.calculate_multiplier(current_cap) if self.performance_engine else {"position_multiplier": 1.0}
+
+        # ── Risk Engine → 리스크 검증 및 계약 수 결정 ──
+        decision = self.risk_engine.validate(
+            signal, vol_state, perf_metrics, self.active_positions,
+            total_capital=current_cap, current_price=current_price
+        )
+
+        if decision["approved"] and decision["contracts"] > 0:
+            logger.info(
+                f"[MORNING] 주문 승인! {signal['direction']} {decision['contracts']}계약 "
+                f"(bull={signal.get('bull_score', 0)}, bear={signal.get('bear_score', 0)})"
+            )
+            order_res = await self.execution_engine.execute_order(
+                code=self.current_code,
+                direction=signal["direction"],
+                qty=decision["contracts"],
+                price=current_price,
+                stop_loss=decision.get("stop_loss", stop_loss),
+                take_profit=decision.get("take_profit", take_profit),
+            )
+
+            order_id = order_res.get("order_id") if order_res["success"] else f"O_MORN_{int(datetime.now().timestamp())}"
+
+            order_db_data = {
+                "order_id": order_id,
+                "futures_code": self.current_code,
+                "order_side": signal["direction"],
+                "order_qty": decision["contracts"],
+                "order_price": current_price,
+                "order_type": "LIMIT",
+                "status": "FILLED" if order_res["success"] else "REJECTED",
+                "result_msg": f"모닝트레이딩: bull={signal.get('bull_score', 0)}, bear={signal.get('bear_score', 0)}" if order_res["success"] else f"주문 실패: {order_res.get('error')}"
+            }
+            try:
+                self.db.save_order(order_db_data)
+            except Exception as e:
+                logger.error(f"모닝 주문 이력 DB 저장 실패: {e}")
+
+            if order_res["success"]:
+                self.morning_engine.record_entry(
+                    side=signal["direction"],
+                    qty=decision["contracts"],
+                    price=current_price,
+                )
+                await self._sync_positions_with_kis()
+
+                # 전략별 점수 상세 로그
+                strategy_detail = ""
+                for name, score_data in signal.get("strategy_scores", {}).items():
+                    if score_data["bull"] > 0 or score_data["bear"] > 0:
+                        strategy_detail += f"  {name}: B={score_data['bull']}/B={score_data['bear']} ({score_data['detail']})\n"
+
+                self.send_telegram(
+                    f"[MORNING {signal['direction']}] 모닝 트레이딩 진입\n"
+                    f"- 방향: {signal['direction']}\n"
+                    f"- 수량: {decision['contracts']}계약\n"
+                    f"- 현재가: {current_price:,.2f}\n"
+                    f"- 손절가: {decision.get('stop_loss', stop_loss):,.2f}\n"
+                    f"- 익절가: {decision.get('take_profit', take_profit):,.2f}\n"
+                    f"- Bull Score: {signal.get('bull_score', 0)}/10\n"
+                    f"- Bear Score: {signal.get('bear_score', 0)}/10\n"
+                    f"- 전략 상세:\n{strategy_detail}"
+                )
 
     def _has_morning_entry_today(self) -> bool:
         """오늘 아침 개장 이후 이미 진입했거나 완료된 거래가 있는지 확인"""
@@ -1130,29 +1393,9 @@ class TradingSupervisor:
 
     def _calculate_indicators(self, candles: List[Dict[str, Any]], current_price: float) -> Dict[str, Any]:
         """최근 분봉 캔들 데이터와 현재가를 기반으로 보조 지표 계산 (NumPy 활용)"""
-        now = datetime.now()
-        # 아침 개장 직후 1시간 동안 (08:45 ~ 09:45) 캔들이 부족할 경우, 모닝 브리핑 점수를 기반으로 한 아침 매매 모드 적용
+        # 캔들 59개 미만이면 정상 지표 계산 불가 (MA60, MACD 등 충분한 데이터 없음)
+        # 모닝 세션(08:45~09:44)은 MorningScalpingEngine이 별도 처리
         if len(candles) < 59:
-            # KST 시간 기준 08:45 ~ 09:45 사이이며 오늘 장 개시 후 첫 진입인 경우
-            if datetime_time(8, 45) <= now.time() < datetime_time(9, 45):
-                if not self._has_morning_entry_today():
-                    today_str = now.strftime("%Y-%m-%d")
-                    try:
-                        briefing = self.db.get_morning_briefing_score(today_str)
-                        if briefing and briefing.get("direction") in ["BUY", "SELL"]:
-                            logger.info(f"[MORNING MODE] 아침 캔들 부족 ({len(candles)}/60) -> 모닝 브리핑 점수를 사용하여 즉시 진입 준비 (방향: {briefing['direction']}, 점수: {briefing['score']})")
-                            return {
-                                "is_morning_mode": True,
-                                "morning_direction": briefing["direction"],
-                                "morning_score": float(briefing["score"]),
-                                "atr": 2.0,  # 아침 모드 기본 ATR값 설정 (약 2.0포인트)
-                                "prev_close": current_price,
-                                "current_price": current_price,
-                                "option_call_net": self._latest_option_call_net,
-                                "option_put_net": self._latest_option_put_net
-                            }
-                    except Exception as e:
-                        logger.error(f"아침 모드 DB 조회 실패: {e}")
             return {}
 
         import numpy as np
@@ -1235,7 +1478,13 @@ class TradingSupervisor:
     async def _process_trading_logic(self, current_price: float):
         """전체 규칙 기반 엔진 및 리스크 관리가 연계된 신호 판별 및 매매 처리"""
         # 0. 장 마감 직전 강제 청산 및 진입 제한 체크
-        if await self._check_and_force_close_at_session_end():
+        # (메인 루프에서 이미 체크됨 — latest_price 유무와 무관하게 보장)
+        if self._is_force_close_active():
+            return
+
+        # ── 모닝 스캘핑 모드 (08:45~09:30): 정상 게이트 우회, 5개 전략 기반 즉시 진입 ──
+        if self.morning_engine and self.morning_engine.is_active:
+            await self._process_morning_trading(current_price)
             return
 
         # 1. Regime Engine -> 시장 상태 검출
@@ -1295,7 +1544,7 @@ class TradingSupervisor:
                 except Exception as e:
                     logger.error(f"Performance Engine 거래 기록 업데이트 실패: {e}")
             
-        flow_direction = "NEUTRAL"
+        flow_direction = "FOREIGN_OK"
         foreign_zscore = 0.0
         
         if self.foreign_flow_engine:
@@ -1313,6 +1562,21 @@ class TradingSupervisor:
             flow_data = self.foreign_flow_engine.get_latest_flow()
             foreign_zscore = flow_data.get("foreign_zscore", 0.0)
             
+        # ── Order Flow / Order Book / Execution Pressure Engine 상태를 indicators에 주입 ──
+        db_code = self.current_code
+        if self.order_flow_engine:
+            indicators["cvd_trend"] = self.order_flow_engine.get_cvd_trend(db_code)
+            indicators["delta_30s"] = self.order_flow_engine.get_delta(db_code, 30)
+            indicators["delta_60s"] = self.order_flow_engine.get_delta(db_code, 60)
+            indicators["buy_ratio_30s"] = self.order_flow_engine.get_buy_ratio(db_code, 30)
+        if self.order_book_engine:
+            indicators["imbalance"] = self.order_book_engine.get_imbalance(db_code)
+            indicators["ofi_30s"] = self.order_book_engine.get_ofi(db_code, 30)
+        if self.execution_pressure_engine:
+            indicators["exec_strength"] = self.execution_pressure_engine.get_exec_strength(db_code)
+            indicators["exec_avg_strength_30s"] = self.execution_pressure_engine.get_avg_exec_strength(db_code, 30)
+            indicators["net_buy_count_30s"] = self.execution_pressure_engine.get_net_buy_count(db_code, 30)
+        
         # 3단계 게이트 기반 최종 신호 생성
         signal = self.signal_engine.generate(
             self.current_code, 

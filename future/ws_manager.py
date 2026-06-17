@@ -214,7 +214,18 @@ class WebSocketManager:
                             "low": float(item["선물최저가"]),
                             "open": float(item["선물시가"]),
                             "time": item["영업시간"],
-                            "timestamp": datetime.now()
+                            "timestamp": datetime.now(),
+                            # --- Order Flow / CVD 필드 ---
+                            "last_volume": int(item["최종거래량"]),
+                            "total_buy_vol": int(item["총매수수량"]),
+                            "total_sell_vol": int(item["총매도수량"]),
+                            "buy_ratio": float(item["매수비율"]),
+                            "exec_strength": float(item["체결강도"]),
+                            "net_buy_count": int(item["순매수체결건수"]),
+                            "ask_price": float(item["선물매도호가"]),
+                            "bid_price": float(item["선물매수호가"]),
+                            "ask_remain": int(item["매도호가잔량"]),
+                            "bid_remain": int(item["매수호가잔량"]),
                         }
                         self.latest_data[code] = parsed_data
                         

@@ -5,6 +5,10 @@ from future.engines.performance_engine import PerformanceEngine
 from future.engines.foreign_flow_engine import ForeignFlowEngine
 from future.engines.risk_engine import RiskEngine
 from future.engines.execution_engine import ExecutionEngine
+from future.engines.order_flow_engine import OrderFlowEngine
+from future.engines.order_book_engine import OrderBookEngine
+from future.engines.execution_pressure_engine import ExecutionPressureEngine
+from future.engines.morning_engine import MorningEngine
 
 __all__ = [
     "RegimeEngine",
@@ -13,5 +17,9 @@ __all__ = [
     "PerformanceEngine",
     "ForeignFlowEngine",
     "RiskEngine",
-    "ExecutionEngine"
+    "ExecutionEngine",
+    "OrderFlowEngine",
+    "OrderBookEngine",
+    "ExecutionPressureEngine",
+    "MorningEngine",
 ]

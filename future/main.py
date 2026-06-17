@@ -24,7 +24,11 @@ from future.engines import (
     PerformanceEngine,
     ForeignFlowEngine,
     RiskEngine,
-    ExecutionEngine
+    ExecutionEngine,
+    OrderFlowEngine,
+    OrderBookEngine,
+    ExecutionPressureEngine,
+    MorningEngine,
 )
 
 # 로깅 설정
@@ -79,6 +83,10 @@ async def lifespan(app: FastAPI):
             max_contracts=5
         )
         exec_eng = ExecutionEngine()
+        order_flow_eng = OrderFlowEngine()
+        order_book_eng = OrderBookEngine()
+        exec_pressure_eng = ExecutionPressureEngine()
+        morning_eng = MorningEngine(db=db_store)
         
         # AI Risk Agent (의결권 없는 리스크 분석용 목객체)
         class MockAIAgent:
@@ -94,7 +102,11 @@ async def lifespan(app: FastAPI):
             perf_eng=perf_eng,
             risk_eng=risk_eng,
             exec_eng=exec_eng,
-            ai_agent=ai_agent
+            ai_agent=ai_agent,
+            order_flow_eng=order_flow_eng,
+            order_book_eng=order_book_eng,
+            exec_pressure_eng=exec_pressure_eng,
+            morning_eng=morning_eng,
         )
         
         # 2.4 수퍼바이저 기동 (웹소켓 연결 및 메인 루프 가동)
